@@ -1,0 +1,70 @@
+project:
+  name: "SensorGuard"
+  version: "1.0.0"
+  description: "Robust and uncertainty-calibrated early fault prediction under progressive multi-sensor degradation"
+
+dataset:
+  name: "NASA C-MAPSS"
+  root_dir: "data/raw"
+  processed_dir: "data/processed"
+  degraded_dir: "data/degraded"
+
+  subsets:
+    - FD001
+    - FD002
+    - FD003
+    - FD004
+
+  sensor_count: 21
+  operating_setting_count: 3
+
+target:
+  type: "early_fault"
+  rul_threshold: 30
+
+window:
+  size: 30
+  stride: 1
+
+training:
+  random_seed: 42
+  batch_size: 64
+  epochs: 50
+  learning_rate: 0.001
+
+model:
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.30
+
+uncertainty:
+  method: "mc_dropout"
+  samples: 50
+
+degradation:
+  levels:
+    - clean
+    - mild
+    - moderate
+    - severe
+    - stress
+
+  mechanisms:
+    - random_dropout
+    - missing_interval
+    - noise
+    - bias
+    - drift
+    - stuck_at
+    - intermittent
+
+evaluation:
+  metrics:
+    - accuracy
+    - precision
+    - recall
+    - f1
+    - auroc
+    - auprc
+    - ece
+    - brier
