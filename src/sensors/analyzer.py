@@ -8,7 +8,6 @@ import pandas as pd
 # SensorGuard - Sensor Analysis
 # ============================================================
 
-
 SENSOR_COLUMNS = [
     f"sensor_{i}"
     for i in range(1, 22)
@@ -38,7 +37,7 @@ def analyze_sensor_statistics(df: pd.DataFrame) -> pd.DataFrame:
                 "min": series.min(),
                 "max": series.max(),
                 "unique_values": series.nunique(),
-                "missing_values": series.isna().sum(),
+                "missing_values": int(series.isna().sum()),
             }
         )
 
@@ -51,22 +50,39 @@ def analyze_sensor_cycle_correlation(
     """
     Calculate Pearson correlation between each sensor
     and engine cycle.
+
+    Constant sensors have undefined correlation because
+    their standard deviation is zero. Such correlations
+    are returned as NaN intentionally.
     """
 
     records = []
+
+    cycle_std = df["cycle"].std()
 
     for sensor in SENSOR_COLUMNS:
 
         if sensor not in df.columns:
             continue
 
-        correlation = df[sensor].corr(df["cycle"])
+        sensor_std = df[sensor].std()
+
+        # Correlation is undefined when either variable
+        # has zero variance.
+        if sensor_std == 0 or cycle_std == 0:
+            correlation = np.nan
+        else:
+            correlation = df[sensor].corr(df["cycle"])
 
         records.append(
             {
                 "sensor": sensor,
                 "cycle_correlation": correlation,
-                "absolute_cycle_correlation": abs(correlation),
+                "absolute_cycle_correlation": (
+                    abs(correlation)
+                    if pd.notna(correlation)
+                    else np.nan
+                ),
             }
         )
 
@@ -191,6 +207,10 @@ def print_sensor_audit(
     print("SensorGuard - Sensor Audit")
     print("=" * 100)
 
+    # --------------------------------------------------------
+    # Sensor Statistics
+    # --------------------------------------------------------
+
     print("\nSensor Statistics")
     print("-" * 100)
 
@@ -208,6 +228,10 @@ def print_sensor_audit(
         ].to_string(index=False)
     )
 
+    # --------------------------------------------------------
+    # Cycle Correlation
+    # --------------------------------------------------------
+
     print("\nCycle Correlation")
     print("-" * 100)
 
@@ -222,12 +246,17 @@ def print_sensor_audit(
         .sort_values(
             "absolute_cycle_correlation",
             ascending=False,
+            na_position="last",
         )
     )
 
     print(
         cycle_table.to_string(index=False)
     )
+
+    # --------------------------------------------------------
+    # Engine-Level Variation
+    # --------------------------------------------------------
 
     print("\nEngine-Level Variation")
     print("-" * 100)
@@ -250,6 +279,10 @@ def print_sensor_audit(
     print(
         engine_table.to_string(index=False)
     )
+
+    # --------------------------------------------------------
+    # Dynamic Range
+    # --------------------------------------------------------
 
     print("\nDynamic Range")
     print("-" * 100)
