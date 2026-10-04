@@ -67,8 +67,6 @@ def analyze_sensor_cycle_correlation(
 
         sensor_std = df[sensor].std()
 
-        # Correlation is undefined when either variable
-        # has zero variance.
         if sensor_std == 0 or cycle_std == 0:
             correlation = np.nan
         else:
@@ -79,6 +77,69 @@ def analyze_sensor_cycle_correlation(
                 "sensor": sensor,
                 "cycle_correlation": correlation,
                 "absolute_cycle_correlation": (
+                    abs(correlation)
+                    if pd.notna(correlation)
+                    else np.nan
+                ),
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+def create_training_rul(
+    df: pd.DataFrame,
+) -> pd.Series:
+    """
+    Create true training RUL for every training observation.
+
+    RUL = maximum cycle of the corresponding engine
+          - current cycle.
+    """
+
+    max_cycles = (
+        df.groupby("engine_id")["cycle"]
+        .transform("max")
+    )
+
+    rul = max_cycles - df["cycle"]
+
+    return rul
+
+
+def analyze_sensor_rul_correlation(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Calculate Pearson correlation between each sensor
+    and the training RUL target.
+    """
+
+    if "rul" not in df.columns:
+        df = df.copy()
+        df["rul"] = create_training_rul(df)
+
+    records = []
+
+    rul_std = df["rul"].std()
+
+    for sensor in SENSOR_COLUMNS:
+
+        if sensor not in df.columns:
+            continue
+
+        sensor_std = df[sensor].std()
+
+        if sensor_std == 0 or rul_std == 0:
+            correlation = np.nan
+        else:
+            correlation = df[sensor].corr(df["rul"])
+
+        records.append(
+            {
+                "sensor": sensor,
+                "rul_correlation": correlation,
+                "absolute_rul_correlation": (
                     abs(correlation)
                     if pd.notna(correlation)
                     else np.nan
@@ -158,6 +219,8 @@ def generate_sensor_audit(
 
     cycle_correlation = analyze_sensor_cycle_correlation(df)
 
+    rul_correlation = analyze_sensor_rul_correlation(df)
+
     engine_variation = analyze_sensor_engine_variation(df)
 
     ranges = analyze_sensor_ranges(df)
@@ -165,6 +228,7 @@ def generate_sensor_audit(
     audit = {
         "statistics": statistics,
         "cycle_correlation": cycle_correlation,
+        "rul_correlation": rul_correlation,
         "engine_variation": engine_variation,
         "ranges": ranges,
     }
@@ -181,13 +245,23 @@ def print_sensor_audit(
 
     statistics = audit["statistics"]
     cycle_correlation = audit["cycle_correlation"]
+    rul_correlation = audit["rul_correlation"]
     engine_variation = audit["engine_variation"]
     ranges = audit["ranges"]
+
+    # --------------------------------------------------------
+    # Combine all audit results
+    # --------------------------------------------------------
 
     combined = (
         statistics
         .merge(
             cycle_correlation,
+            on="sensor",
+            how="left",
+        )
+        .merge(
+            rul_correlation,
             on="sensor",
             how="left",
         )
@@ -252,6 +326,32 @@ def print_sensor_audit(
 
     print(
         cycle_table.to_string(index=False)
+    )
+
+    # --------------------------------------------------------
+    # RUL Correlation
+    # --------------------------------------------------------
+
+    print("\nRUL Correlation")
+    print("-" * 100)
+
+    rul_table = (
+        combined[
+            [
+                "sensor",
+                "rul_correlation",
+                "absolute_rul_correlation",
+            ]
+        ]
+        .sort_values(
+            "absolute_rul_correlation",
+            ascending=False,
+            na_position="last",
+        )
+    )
+
+    print(
+        rul_table.to_string(index=False)
     )
 
     # --------------------------------------------------------
