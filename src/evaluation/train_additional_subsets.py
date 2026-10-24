@@ -1,16 +1,16 @@
 
 """
-SensorGuard — Train additional C-MAPSS subsets.
+SensorGuard — Train Additional C-MAPSS Subsets
 
-Trains FD002, FD003 and FD004 using the existing pipeline.
-FD001 is deliberately excluded and its checkpoint is untouched.
+Trains FD002, FD003, and FD004 using the existing pipeline.
+FD001 is excluded and its checkpoint is never modified by this script.
 
 Protocol:
 - Engine-level 85/15 training-validation split.
-- StandardScaler fitted on training engines only.
-- Positive-class weight computed from training-window labels only.
-- Validation loss controls early stopping and checkpoint selection.
-- Official test labels are never used for training or model selection.
+- Scaler fitted on training engines only.
+- Positive-class weight calculated from training labels only.
+- Early stopping based on validation loss.
+- Official test data is not passed to the trainer.
 """
 
 from __future__ import annotations
@@ -67,9 +67,7 @@ def set_seed(seed: int = SEED) -> None:
 
 
 def calculate_positive_class_weight(y_train: np.ndarray) -> float:
-    """
-    Calculate negative/positive ratio using training labels only.
-    """
+    """Calculate negative/positive ratio from training labels only."""
     labels = np.asarray(y_train).reshape(-1)
 
     positives = int(np.sum(labels == 1))
@@ -89,17 +87,20 @@ def calculate_positive_class_weight(y_train: np.ndarray) -> float:
 
 
 def train_subset(subset: str, force: bool = False) -> dict:
-    """Train one subset and save its checkpoint and history."""
+    """Train one subset and save its checkpoint, history, and report."""
 
     set_seed(SEED)
 
-    checkpoint_dir = PROJECT_ROOT / "results" / "models" / subset
+    checkpoint_dir = (
+        PROJECT_ROOT / "results" / "models" / subset
+    )
     checkpoint_path = checkpoint_dir / "baseline_lstm.pt"
 
     output_dir = PROJECT_ROOT / "results" / "metrics" / subset
     history_path = output_dir / "training_history.csv"
     report_path = output_dir / "training_report.json"
 
+    # Never overwrite an existing checkpoint unless explicitly requested.
     if checkpoint_path.exists() and not force:
         print(
             f"\n[SKIP] {subset}: checkpoint already exists:\n"
@@ -116,7 +117,9 @@ def train_subset(subset: str, force: bool = False) -> dict:
     print(f"Training SensorGuard baseline: {subset}")
     print("=" * 76)
 
-    # Load and sort this subset's data.
+    # ---------------------------------------------------------
+    # 1. Load and sort dataset
+    # ---------------------------------------------------------
     dataset = load_dataset(subset)
 
     train_df = dataset["train"].copy()
@@ -124,14 +127,18 @@ def train_subset(subset: str, force: bool = False) -> dict:
     rul_df = dataset["rul"].copy()
 
     train_df = train_df.sort_values(
-        ["engine_id", "cycle"], kind="stable"
+        ["engine_id", "cycle"],
+        kind="stable",
     ).reset_index(drop=True)
 
     test_df = test_df.sort_values(
-        ["engine_id", "cycle"], kind="stable"
+        ["engine_id", "cycle"],
+        kind="stable",
     ).reset_index(drop=True)
 
-    # Reuse the project's established split, scaler and window pipeline.
+    # ---------------------------------------------------------
+    # 2. Prepare engine-level split, scaling, and windows
+    # ---------------------------------------------------------
     prepared = prepare_training_validation_test(
         train_df=train_df,
         test_df=test_df,
@@ -151,15 +158,23 @@ def train_subset(subset: str, force: bool = False) -> dict:
     X_val = np.asarray(prepared["X_validation"])
     y_val = np.asarray(prepared["y_validation"]).astype(int)
 
-    # Defensive checks before training.
+    # ---------------------------------------------------------
+    # 3. Validate training and validation data
+    # ---------------------------------------------------------
     if len(X_train) == 0 or len(X_val) == 0:
-        raise ValueError(f"{subset}: training or validation windows are empty.")
+        raise ValueError(
+            f"{subset}: training or validation windows are empty."
+        )
 
     if not np.isfinite(X_train).all():
-        raise ValueError(f"{subset}: training windows contain non-finite values.")
+        raise ValueError(
+            f"{subset}: training windows contain non-finite values."
+        )
 
     if not np.isfinite(X_val).all():
-        raise ValueError(f"{subset}: validation windows contain non-finite values.")
+        raise ValueError(
+            f"{subset}: validation windows contain non-finite values."
+        )
 
     if set(np.unique(y_train)) != {0, 1}:
         raise ValueError(
@@ -171,16 +186,20 @@ def train_subset(subset: str, force: bool = False) -> dict:
             f"{subset}: validation labels must contain both classes."
         )
 
-    # Compute the class weight using training labels only.
+    # ---------------------------------------------------------
+    # 4. Calculate class weight using training labels only
+    # ---------------------------------------------------------
     positive_weight = calculate_positive_class_weight(y_train)
 
-    print(f"Training windows:   {len(X_train):,}")
-    print(f"Validation windows: {len(X_val):,}")
-    print(f"Training positives: {int(y_train.sum()):,}")
-    print(f"Training negatives: {int((y_train == 0).sum()):,}")
-    print(f"Positive-class weight: {positive_weight:.6f}")
+    print(f"Training windows:       {len(X_train):,}")
+    print(f"Validation windows:     {len(X_val):,}")
+    print(f"Training positives:     {int(y_train.sum()):,}")
+    print(f"Training negatives:     {int((y_train == 0).sum()):,}")
+    print(f"Positive-class weight:  {positive_weight:.6f}")
 
-    # Shuffle training batches, not validation batches.
+    # ---------------------------------------------------------
+    # 5. Create data loaders
+    # ---------------------------------------------------------
     train_loader = create_dataloader(
         X_train,
         y_train,
@@ -195,6 +214,9 @@ def train_subset(subset: str, force: bool = False) -> dict:
         shuffle=False,
     )
 
+    # ---------------------------------------------------------
+    # 6. Create model and trainer
+    # ---------------------------------------------------------
     model = create_baseline_model(
         input_size=len(SENSOR_COLUMNS),
         hidden_size=HIDDEN_SIZE,
@@ -211,7 +233,9 @@ def train_subset(subset: str, force: bool = False) -> dict:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Training uses only training and validation loaders.
+    # ---------------------------------------------------------
+    # 7. Train using training and validation data only
+    # ---------------------------------------------------------
     # The official test set is not passed to the trainer.
     fit_result = trainer.fit(
         train_loader=train_loader,
@@ -221,29 +245,29 @@ def train_subset(subset: str, force: bool = False) -> dict:
         checkpoint_path=checkpoint_path,
     )
 
-    # Save history if the trainer exposes a history attribute.
-    history = getattr(trainer, "history", None)
-
-    if history is not None:
-        if isinstance(history, pd.DataFrame):
-            history_df = history
-        else:
-            history_df = pd.DataFrame(history)
-
-        if not history_df.empty:
-            history_df.to_csv(history_path, index=False)
-            print(f"Training history saved: {history_path}")
-    else:
-        print(
-            "Note: trainer.history was not available; "
-            "the checkpoint and training report will still be saved."
+    # ---------------------------------------------------------
+    # 8. Save epoch-by-epoch training history
+    # ---------------------------------------------------------
+    if not isinstance(fit_result, dict):
+        raise TypeError(
+            "Expected BaselineTrainer.fit() to return a history dictionary; "
+            f"received {type(fit_result).__name__}."
         )
 
-    # Read the saved checkpoint to report the selected epoch and loss.
+    history_df = pd.DataFrame(fit_result)
+    history_df.index = history_df.index + 1
+    history_df.index.name = "epoch"
+    history_df.to_csv(history_path)
+
+    print(f"\nTraining history saved: {history_path}")
+
+    # ---------------------------------------------------------
+    # 9. Verify and read the best checkpoint
+    # ---------------------------------------------------------
     if not checkpoint_path.exists():
         raise FileNotFoundError(
-            "Training finished but the expected checkpoint was not found. "
-            "Check the BaselineTrainer.fit implementation."
+            "Training finished but the expected checkpoint was not found: "
+            f"{checkpoint_path}"
         )
 
     try:
@@ -253,8 +277,14 @@ def train_subset(subset: str, force: bool = False) -> dict:
             weights_only=True,
         )
     except TypeError:
-        saved = torch.load(checkpoint_path, map_location="cpu")
+        saved = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+        )
 
+    # ---------------------------------------------------------
+    # 10. Save reproducibility report
+    # ---------------------------------------------------------
     report = {
         "subset": subset,
         "status": "trained",
@@ -275,17 +305,18 @@ def train_subset(subset: str, force: bool = False) -> dict:
         "selected_epoch": saved.get("epoch"),
         "best_validation_loss": saved.get("best_validation_loss"),
         "validation_metrics": saved.get("validation_metrics"),
-        "fit_return_type": type(fit_result).__name__,
+        "history_csv": str(history_path),
     }
 
     with report_path.open("w", encoding="utf-8") as file:
         json.dump(report, file, indent=2, default=str)
 
     print("\nTraining completed.")
-    print(f"Selected epoch: {report['selected_epoch']}")
-    print(f"Best validation loss: {report['best_validation_loss']}")
-    print(f"Checkpoint: {checkpoint_path}")
-    print(f"Report: {report_path}")
+    print(f"Selected epoch:       {report['selected_epoch']}")
+    print(f"Best validation loss:  {report['best_validation_loss']}")
+    print(f"Checkpoint:            {checkpoint_path}")
+    print(f"Training history:      {history_path}")
+    print(f"Training report:       {report_path}")
 
     return report
 
@@ -294,22 +325,32 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train SensorGuard baselines for FD002-FD004."
     )
+
     parser.add_argument(
         "--force",
         action="store_true",
         help="Retrain even if a subset checkpoint already exists.",
     )
+
     args = parser.parse_args()
 
     print(f"Project root: {PROJECT_ROOT}")
-    print(f"Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
-    print("FD001 will not be retrained or modified.")
+    print(
+        f"Device: {'cuda' if torch.cuda.is_available() else 'cpu'}"
+    )
+    print("Subsets: FD002, FD003, FD004")
+    print("FD001 will not be retrained by this script.")
 
     reports = []
 
     for subset in SUBSETS:
         try:
-            reports.append(train_subset(subset, force=args.force))
+            report = train_subset(
+                subset=subset,
+                force=args.force,
+            )
+            reports.append(report)
+
         except Exception as exc:
             print(f"\n[ERROR] {subset}: {exc}")
             raise
@@ -320,6 +361,7 @@ def main() -> None:
         / "metrics"
         / "additional_subset_training_summary.json"
     )
+
     summary_path.parent.mkdir(parents=True, exist_ok=True)
 
     with summary_path.open("w", encoding="utf-8") as file:
