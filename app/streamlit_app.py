@@ -1,10 +1,16 @@
 ﻿from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import torch
 
+from src.data.loader import load_dataset
+from src.features.dataset_builder import prepare_training_validation_test
+from src.models.baseline import create_baseline_model
+from src.inference import predict_uploaded_engines
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "results" / "metrics"
 
@@ -66,6 +72,7 @@ rq2 = load_csv(str(RQ2_FILE))
 rq2_summary = load_csv(str(RQ2_SUMMARY_FILE))
 rq1 = load_csv(str(RQ1_FILE))
 bootstrap = load_csv(str(BOOTSTRAP_FILE))
+official_test = load_csv(str(RESULTS / "official_test_evaluation_summary.csv"))
 
 
 def show_missing_files():
@@ -112,6 +119,8 @@ with st.sidebar:
             "Results Explorer",
             "Uncertainty Analysis",
             "Calibration",
+            "Official Test Results",
+             "Upload & Predict",
             "Project Information",
         ],
     )
@@ -122,7 +131,7 @@ with st.sidebar:
     st.markdown("**Mode**")
     st.caption("Saved experiment results")
     st.markdown(
-        '<p class="small-note">Live inference is not connected in this version.</p>',
+        '<p class="small-note">Saved results + uploaded-CSV inference.</p>',
         unsafe_allow_html=True,
     )
 
@@ -371,6 +380,204 @@ elif page == "Calibration":
         st.caption("No saved reliability diagrams found at the expected paths.")
 
 
+elif page == "Official Test Results":
+    st.subheader("Official test-set evaluation")
+    st.caption("Saved offline evaluation results at the fixed 0.50 classification threshold.")
+
+    if official_test.empty:
+        st.error("Official test results CSV was not found.")
+    else:
+        display = official_test.copy()
+        metric_columns = {
+            "Accuracy": "accuracy",
+            "Precision": "precision",
+            "Recall": "recall",
+            "F1-score": "f1",
+            "AUROC": "auroc",
+            "AUPRC": "auprc",
+            "Brier score": "brier_score",
+            "Log loss": "log_loss",
+        }
+
+        for column in metric_columns.values():
+            if column in display.columns:
+                display[column] = pd.to_numeric(display[column], errors="coerce")
+
+        required = ["subset", "accuracy", "precision", "recall", "f1", "auroc"]
+        missing = [column for column in required if column not in display.columns]
+
+        if missing:
+            st.error(f"Required columns missing: {', '.join(missing)}")
+            st.dataframe(display, hide_index=True)
+        else:
+            best_f1 = display.loc[display["f1"].idxmax()]
+            best_auc = display.loc[display["auroc"].idxmax()]
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Subsets evaluated", len(display))
+            c2.metric("Highest F1", best_f1["subset"], f"{best_f1['f1']:.1%}")
+            c3.metric("Highest AUROC", best_auc["subset"], f"{best_auc['auroc']:.1%}")
+
+            st.markdown("### Classification performance")
+            choices = ["Accuracy", "Precision", "Recall", "F1-score", "AUROC", "AUPRC"]
+            selected = st.multiselect(
+                "Metrics to compare",
+                choices,
+                default=["F1-score", "AUROC", "AUPRC"],
+            )
+
+            if selected:
+                cols = [metric_columns[name] for name in selected if metric_columns[name] in display.columns]
+                if cols:
+                    chart_data = display[["subset"] + cols].melt(
+                        id_vars="subset", var_name="Metric", value_name="Score"
+                    )
+                    labels = {value: key for key, value in metric_columns.items()}
+                    chart_data["Metric"] = chart_data["Metric"].map(labels)
+                    fig = px.bar(
+                        chart_data, x="subset", y="Score", color="Metric",
+                        barmode="group", range_y=[0, 1],
+                        title="Official test-set comparison",
+                    )
+                    st.plotly_chart(chart_theme(fig), use_container_width=True)
+
+            st.markdown("### Probability quality")
+            prob_cols = [
+                metric_columns[name] for name in ["Brier score", "Log loss"]
+                if metric_columns[name] in display.columns
+            ]
+            if prob_cols:
+                prob_data = display[["subset"] + prob_cols].melt(
+                    id_vars="subset", var_name="Metric", value_name="Score"
+                )
+                labels = {value: key for key, value in metric_columns.items()}
+                prob_data["Metric"] = prob_data["Metric"].map(labels)
+                fig = px.bar(
+                    prob_data, x="subset", y="Score", color="Metric",
+                    barmode="group", title="Probability metrics (lower is better)",
+                )
+                st.plotly_chart(chart_theme(fig), use_container_width=True)
+
+            st.markdown("### Full evaluation table")
+            st.dataframe(display, use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download official test summary",
+                display.to_csv(index=False).encode("utf-8"),
+                file_name="sensorguard_official_test_summary.csv",
+                mime="text/csv",
+            )
+
+            st.info("AUROC measures ranking across thresholds. Precision, recall, and F1 use the fixed 0.50 threshold.")
+            st.warning(
+                "C-MAPSS labels here are derived from the RUL-based early-fault target, "
+                "not independently verified sensor failures. These are saved offline results, not live predictions."
+            )
+
+elif page == "Upload & Predict":
+    st.subheader("Upload sensor data and predict")
+    st.caption(
+        "Run inference using a saved LSTM checkpoint for the selected C-MAPSS subset."
+    )
+
+    st.warning(
+        "Predictions estimate the RUL-derived early-fault target "
+        "(RUL <= 30 cycles). They do not confirm physical sensor failures."
+    )
+
+    selected_subset = st.selectbox(
+        "Select model / C-MAPSS subset",
+        ["FD001", "FD002", "FD003", "FD004"],
+    )
+
+    uploaded_file = st.file_uploader(
+        "Upload a C-MAPSS-compatible CSV",
+        type=["csv"],
+        key="prediction_csv",
+    )
+
+    if uploaded_file is None:
+        st.info(
+            "Upload a CSV containing engine_id, cycle, and sensor_1 through "
+            "sensor_21. Each engine needs at least 30 cycles."
+        )
+    else:
+        try:
+            uploaded_df = pd.read_csv(uploaded_file)
+
+            st.markdown("### Uploaded data preview")
+            st.dataframe(
+                uploaded_df.head(),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            if st.button("Run prediction", type="primary"):
+                with st.spinner("Running predictions using the saved model..."):
+                    predictions, skipped_engines = predict_uploaded_engines(
+                        uploaded_df,
+                        selected_subset,
+                    )
+
+                st.success("Prediction process completed.")
+
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    st.metric("Engines predicted", len(predictions))
+
+                with col2:
+                    flagged = (
+                        int((predictions["predicted_class"] == 1).sum())
+                        if not predictions.empty
+                        else 0
+                    )
+                    st.metric("Early-fault predictions", flagged)
+
+                with col3:
+                    st.metric("Engines skipped", skipped_engines)
+
+                st.markdown("### Prediction results")
+                st.dataframe(
+                    predictions,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                if not predictions.empty:
+                    fig = px.bar(
+                        predictions,
+                        x="engine_id",
+                        y="early_fault_probability",
+                        color="predicted_label",
+                        range_y=[0, 1],
+                        title="Early-fault probability by engine",
+                        labels={
+                            "engine_id": "Engine ID",
+                            "early_fault_probability": "Early-fault probability",
+                            "predicted_label": "Prediction",
+                        },
+                    )
+                    st.plotly_chart(
+                        chart_theme(fig),
+                        use_container_width=True,
+                    )
+
+                    st.download_button(
+                        "Download prediction results",
+                        predictions.to_csv(index=False).encode("utf-8"),
+                        file_name="sensorguard_predictions.csv",
+                        mime="text/csv",
+                    )
+
+                if skipped_engines:
+                    st.warning(
+                        f"Number of engines skipped: {skipped_engines}. "
+                        "Check that each has at least 30 valid cycles."
+                    )
+
+        except Exception as exc:
+            st.error(f"Prediction failed: {exc}")
+
 else:
     st.subheader("About SensorGuard")
     st.markdown("""
@@ -392,4 +599,9 @@ else:
     """)
 
 st.divider()
-st.caption("SensorGuard · Research prototype · Saved experiment results")
+st.caption("SensorGuard · Research prototype · Saved results and uploaded-CSV inference")
+
+
+
+
+
